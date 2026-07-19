@@ -17,7 +17,17 @@ skia-python>=87.7
 spandrel>=0.3.0
 torch
 torchvision
-transformers>=5.0.0
+# transformers is pinned <5.0.0 (not >=5.0.0) because every pre-"Surya 2"
+# surya-ocr release (0.14.0-0.17.1 - see the surya-ocr comment further down)
+# breaks under transformers>=5.0.0 with:
+#   'SuryaDecoderConfig' object has no attribute 'pad_token_id'
+# This is a confirmed upstream bug (datalab-to/surya#484); the reported fix
+# is to stay on transformers<=4.57.3. diffusers>=0.37.0, manga-ocr, and
+# gradio here don't require transformers>=5.0.0 for anything we use, so
+# pinning down is the lower-risk direction - if a future bump of any of
+# those three starts requiring transformers>=5.0.0, re-check this pin
+# against surya-ocr's status first (upstream may have fixed #484 by then).
+transformers>=4.50.0,<=4.57.3
 uharfbuzz>=0.48.0
 ultralytics>=8.3.94
 # surya-ocr is intentionally NOT listed here. Every 0.14.0-0.17.1 release
