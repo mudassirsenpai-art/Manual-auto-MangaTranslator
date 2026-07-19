@@ -1,7 +1,4 @@
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import List, Optional, Tuple
 
 import cv2
@@ -858,18 +855,10 @@ def extract_text_with_paddle_ocr_vl(
         verbose: Whether to print verbose output
 
     Returns:
-        List of extracted text strings (one per image). Returns [OCR FAILED] on errors
-        or if a single image's generation exceeds the per-image timeout.
+        List of extracted text strings (one per image). Returns [OCR FAILED] on errors.
     """
     if not images:
         return []
-
-    # Hard ceiling on how long a single image's OCR generation may run.
-    # Prevents one slow/stuck bubble (e.g. cold CPU, runner throttling,
-    # a pathological image) from hanging the entire job indefinitely.
-    # Override via env var if a given deployment needs more headroom.
-    per_image_timeout_s = float(os.environ.get("PADDLE_OCR_VL_TIMEOUT_S", "180"))
-    max_new_tokens = int(os.environ.get("PADDLE_OCR_VL_MAX_NEW_TOKENS", "384"))
 
     try:
         model_manager = get_model_manager()
@@ -891,9 +880,8 @@ def extract_text_with_paddle_ocr_vl(
 
                 log_message(
                     f"Processing image {i + 1}/{len(images)} with PaddleOCR-VL-1.6",
-                    always_print=True,
+                    verbose=verbose,
                 )
-                start_t = time.monotonic()
 
                 messages = [
                     {
@@ -917,46 +905,10 @@ def extract_text_with_paddle_ocr_vl(
                     },
                 ).to(model.device)
 
-                def _run_generate():
-                    with torch.no_grad():
-                        return model.generate(**inputs, max_new_tokens=max_new_tokens)
-
-                # model.generate() has no built-in deadline and this call runs
-                # inside worker threads (asyncio + ThreadPoolExecutor), so
-                # signal-based timeouts aren't usable here. Run generation in
-                # its own thread and enforce the deadline from this thread instead.
-                # NOTE: we deliberately don't use `with ThreadPoolExecutor(...) as`
-                # here — that would call shutdown(wait=True) on exit and block
-                # until the stuck generate() call finishes, defeating the point
-                # of the timeout. We shut down without waiting instead.
-                gen_executor = ThreadPoolExecutor(max_workers=1)
-                future = gen_executor.submit(_run_generate)
-                try:
-                    outputs = future.result(timeout=per_image_timeout_s)
-                except FuturesTimeoutError:
-                    elapsed = time.monotonic() - start_t
-                    log_message(
-                        f"PaddleOCR-VL-1.6 timed out for image {i + 1} "
-                        f"after {elapsed:.0f}s (limit {per_image_timeout_s:.0f}s); "
-                        f"skipping this bubble",
-                        always_print=True,
-                    )
-                    extracted_texts.append("[OCR FAILED]")
-                    # Don't block waiting for the stuck worker thread to exit;
-                    # it will be reclaimed (or die with the process) later.
-                    gen_executor.shutdown(wait=False)
-                    continue
-                else:
-                    gen_executor.shutdown(wait=False)
+                outputs = model.generate(**inputs, max_new_tokens=1024)
 
                 text = processor.decode(outputs[0][inputs["input_ids"].shape[-1] : -1])
                 extracted_texts.append(text.strip() if text else "")
-
-                elapsed = time.monotonic() - start_t
-                log_message(
-                    f"Finished image {i + 1}/{len(images)} in {elapsed:.1f}s",
-                    always_print=True,
-                )
 
             except Exception as e:
                 log_message(
