@@ -90,7 +90,7 @@ class TranslationConfig:
     previous_context_text_count: int = 0
     osb_min_side_pixels: int = 128
     special_instructions: Optional[str] = None
-    ocr_method: str = "LLM"  # "LLM", "manga-ocr", or "paddleocr-vl-1.6"
+    ocr_method: str = "LLM"  # "LLM", "manga-ocr", "paddleocr-vl-1.6", "surya-ocr", or "paddleocr-classic"
     request_coordinator: Optional[Any] = None
 
 
