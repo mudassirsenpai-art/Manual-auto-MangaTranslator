@@ -18,6 +18,247 @@ from utils.model_metadata import (
 )
 
 
+def _run_manual_pass1(args, config):
+    """
+    Manual translation mode, Pass 1: run detection + cleaning + OCR-only
+    (no translation API call) for every image in --input, write one .pkl
+    checkpoint per image into --manual-ocr-checkpoint, and build a single
+    combined_translations.json in that same directory summarizing every
+    page's OCR'd bubbles (in reading order) for external editing.
+
+    If --output is given, cleaned-but-untranslated preview images are also
+    written there (filename mirrors the input image name) so a caller can
+    show the user what got detected/cleaned before they edit the JSON.
+    """
+    import json as _json
+
+    from core.pipeline import list_manual_mode_images, load_manual_checkpoint, translate_and_render
+    from utils.logging import log_message
+
+    input_dir = Path(args.input)
+    if not input_dir.is_dir():
+        log_message(
+            f"Error: --manual-ocr-checkpoint requires --input '{args.input}' "
+            "to be a directory of images.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    checkpoint_dir = Path(args.manual_ocr_checkpoint)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir = Path(args.output) if args.output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    images = list_manual_mode_images(input_dir)
+    if not images:
+        log_message(
+            f"Error: no images found in '{input_dir}' for Manual mode Pass 1.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    pages = []
+    error_count = 0
+
+    for image_path in images:
+        stem = image_path.stem
+        checkpoint_path = checkpoint_dir / f"{stem}.pkl"
+        preview_path = None
+        if output_dir:
+            preview_path = output_dir / image_path.name
+
+        log_message(
+            f"Manual Pass 1: OCR-only processing {image_path.name}...",
+            always_print=True,
+        )
+        try:
+            translate_and_render(
+                image_path,
+                config,
+                output_path=preview_path,
+                manual_checkpoint_save_path=checkpoint_path,
+            )
+        except Exception as e:
+            log_message(
+                f"Manual Pass 1 failed on {image_path.name}: {e}",
+                always_print=True,
+            )
+            error_count += 1
+            continue
+
+        try:
+            checkpoint = load_manual_checkpoint(checkpoint_path)
+        except Exception as e:
+            log_message(
+                f"Manual Pass 1: wrote checkpoint but failed to re-read it "
+                f"for {image_path.name}: {e}",
+                always_print=True,
+            )
+            error_count += 1
+            continue
+
+        bubbles = []
+        for bubble in checkpoint.get("sorted_bubble_data", []):
+            bubbles.append(
+                {
+                    "bubble_id": bubble.get("bubble_id"),
+                    "ocr_text": bubble.get("ocr_text", ""),
+                    "translation": "",
+                    "is_outside_text": bool(bubble.get("is_outside_text", False)),
+                }
+            )
+
+        pages.append(
+            {
+                "source_file": image_path.name,
+                "checkpoint_file": checkpoint_path.name,
+                "bubbles": bubbles,
+            }
+        )
+
+    combined = {
+        "version": 1,
+        "input_language": config.translation.input_language,
+        "output_language": config.translation.output_language,
+        "pages": pages,
+    }
+    combined_json_path = checkpoint_dir / "combined_translations.json"
+    combined_json_path.write_text(
+        _json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log_message(
+        f"Manual Pass 1 complete: {len(pages)} page(s) checkpointed to "
+        f"'{checkpoint_dir}', translations JSON at '{combined_json_path}'.",
+        always_print=True,
+    )
+    if error_count:
+        log_message(
+            f"Manual Pass 1: {error_count} page(s) failed and were skipped.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+
+def _run_manual_pass2(args, config):
+    """
+    Manual translation mode, Pass 2: read the (possibly user-edited)
+    combined_translations.json, match each page back to its .pkl checkpoint
+    in --manual-render-checkpoint by source_file/checkpoint_file, and render
+    each page's translations directly from the checkpoint (no detection,
+    cleaning, or OCR re-run). Output goes to --output.
+    """
+    import json as _json
+
+    from core.pipeline import translate_and_render
+    from utils.logging import log_message
+
+    checkpoint_dir = Path(args.manual_render_checkpoint)
+    if not checkpoint_dir.is_dir():
+        log_message(
+            f"Error: --manual-render-checkpoint '{checkpoint_dir}' is not a "
+            "directory.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    translations_path = Path(args.manual_translations_json)
+    if not translations_path.is_file():
+        log_message(
+            f"Error: --manual-translations-json '{translations_path}' not found.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    try:
+        combined = _json.loads(translations_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log_message(
+            f"Error: could not parse --manual-translations-json "
+            f"'{translations_path}': {e}",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    pages = combined.get("pages", [])
+    if not pages:
+        log_message(
+            f"Error: '{translations_path}' has no pages to render.",
+            always_print=True,
+        )
+        raise SystemExit(1)
+
+    output_dir = Path(args.output) if args.output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    error_count = 0
+
+    for page in pages:
+        source_file = page.get("source_file")
+        checkpoint_name = page.get("checkpoint_file") or (
+            f"{Path(source_file).stem}.pkl" if source_file else None
+        )
+        if not checkpoint_name:
+            log_message(
+                f"Manual Pass 2: page entry missing source_file/checkpoint_file, "
+                f"skipping: {page}",
+                always_print=True,
+            )
+            error_count += 1
+            continue
+
+        checkpoint_path = checkpoint_dir / checkpoint_name
+        if not checkpoint_path.is_file():
+            log_message(
+                f"Manual Pass 2: checkpoint '{checkpoint_path}' not found for "
+                f"page '{source_file}', skipping.",
+                always_print=True,
+            )
+            error_count += 1
+            continue
+
+        translations_map = {}
+        for bubble in page.get("bubbles", []):
+            bubble_id = bubble.get("bubble_id")
+            if not bubble_id:
+                continue
+            translations_map[bubble_id] = bubble.get("translation", "")
+
+        out_name = source_file or checkpoint_path.stem
+        output_path = output_dir / out_name if output_dir else None
+
+        log_message(
+            f"Manual Pass 2: rendering {out_name} from checkpoint "
+            f"'{checkpoint_path.name}'...",
+            always_print=True,
+        )
+        try:
+            translate_and_render(
+                checkpoint_path,
+                config,
+                output_path=output_path,
+                manual_checkpoint_load_path=checkpoint_path,
+                manual_translations=translations_map,
+            )
+        except Exception as e:
+            log_message(
+                f"Manual Pass 2 failed on '{checkpoint_path.name}': {e}",
+                always_print=True,
+            )
+            error_count += 1
+            continue
+
+    log_message(
+        f"Manual Pass 2 complete: {len(pages) - error_count}/{len(pages)} "
+        f"page(s) rendered to '{output_dir}'.",
+        always_print=True,
+    )
+    if error_count:
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Translate manga/comic speech bubbles using a configuration approach",
@@ -866,7 +1107,62 @@ def main():
         enable_web_search=False,
     )
 
+    # --- Manual translation mode (two-pass human-in-the-loop workflow) ---
+    parser.add_argument(
+        "--manual-ocr-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Manual translation mode, Pass 1. Directory to write one .pkl "
+            "checkpoint per input image (detection + cleaning + OCR-only "
+            "state, no translation API call) plus a combined_translations.json "
+            "summarizing every page's OCR'd bubbles for external editing. "
+            "Requires --batch. Mutually exclusive with --manual-render-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--manual-render-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Manual translation mode, Pass 2. Directory containing the .pkl "
+            "checkpoints written by a prior --manual-ocr-checkpoint run. "
+            "Detection/cleaning/OCR are skipped entirely; only rendering runs, "
+            "using the translations supplied via --manual-translations-json. "
+            "Requires --batch and --manual-translations-json. Mutually "
+            "exclusive with --manual-ocr-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--manual-translations-json",
+        type=str,
+        default=None,
+        help=(
+            "Manual translation mode, Pass 2. Path to the (possibly "
+            "user-edited) combined_translations.json produced during Pass 1. "
+            "Required together with --manual-render-checkpoint."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.manual_ocr_checkpoint and args.manual_render_checkpoint:
+        parser.error(
+            "--manual-ocr-checkpoint and --manual-render-checkpoint are "
+            "mutually exclusive - use one per pass."
+        )
+    if args.manual_render_checkpoint and not args.manual_translations_json:
+        parser.error(
+            "--manual-render-checkpoint requires --manual-translations-json."
+        )
+    if args.manual_translations_json and not args.manual_render_checkpoint:
+        parser.error(
+            "--manual-translations-json requires --manual-render-checkpoint."
+        )
+    if (args.manual_ocr_checkpoint or args.manual_render_checkpoint) and not args.batch:
+        parser.error(
+            "--manual-ocr-checkpoint/--manual-render-checkpoint require --batch."
+        )
 
     if args.osb_flux_backend == "nunchaku" and args.osb_inpainting_method in (
         "flux_klein_9b",
@@ -1224,6 +1520,15 @@ def main():
     )
 
     clamp_settings(config)
+
+    # --- Manual translation mode: two-pass human-in-the-loop workflow ---
+    if args.manual_ocr_checkpoint:
+        _run_manual_pass1(args, config)
+        return
+    if args.manual_render_checkpoint:
+        _run_manual_pass2(args, config)
+        return
+
     # --- Execute ---
     if args.batch:
         input_path = Path(args.input)
