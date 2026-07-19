@@ -2,6 +2,7 @@ import asyncio
 import base64
 import math
 import os
+import pickle
 import re
 import threading
 import time
@@ -50,6 +51,7 @@ from .outside_text_processor import (
 )
 from .services.translation import (
     call_translation_api_batch,
+    perform_ocr_only_batch,
     prepare_bubble_images_for_translation,
 )
 from .text.placeholders import generate_test_placeholders
@@ -130,6 +132,405 @@ def _clean_speech_bubbles_for_page(
         return fallback_cv_image.copy(), []
 
 
+def compute_bubble_id(bbox, is_outside_text: bool = False, salt: str = "") -> str:
+    """
+    Build a stable identifier for a bubble/OSB text-element from its bbox.
+
+    The id is derived only from geometry (and the outside-text flag), so it
+    stays identical between Manual mode's Pass 1 (OCR capture) and Pass 2
+    (checkpoint reload) runs, as long as detection/cleaning are not re-run
+    with different settings in between. `salt` can be used by callers to
+    additionally namespace ids per-image when needed (e.g. multi-file jobs
+    sharing one combined JSON).
+    """
+    try:
+        bx = tuple(int(round(float(v))) for v in bbox)
+    except Exception:
+        bx = tuple(bbox) if bbox else ()
+    kind = "osb" if is_outside_text else "bubble"
+    base = (
+        f"{salt}:{kind}:{bx[0]}_{bx[1]}_{bx[2]}_{bx[3]}"
+        if len(bx) == 4
+        else f"{salt}:{kind}:{bx}"
+    )
+    return base.strip(":")
+
+
+def save_manual_checkpoint(
+    checkpoint_path: Union[str, Path],
+    *,
+    pil_cleaned_image: Image.Image,
+    sorted_bubble_data: List[Dict[str, Any]],
+    processed_bubbles_info: List[Dict[str, Any]],
+    outside_text_data: List[Dict[str, Any]],
+    ocr_texts: List[str],
+    target_mode: str,
+    image_path: Union[str, Path],
+    config: "MangaTranslatorConfig",
+) -> None:
+    """
+    Persist everything Pass 2 (manual translation render) needs to disk, so
+    detection/cleaning/OCR never have to run twice for the same page.
+
+    This is a plain pickle of picklable, already in-memory objects (PIL
+    image, numpy mask arrays, plain dict/list metadata) - nothing here talks
+    to the network or re-invokes any model.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Strip heavy/non-essential transient fields we don't need for rendering
+    # (e.g. base64 crops already consumed by OCR) to keep checkpoints small,
+    # but keep everything the render loop reads.
+    slim_bubbles = []
+    for i, bubble in enumerate(sorted_bubble_data):
+        slim = dict(bubble)
+        slim.pop("image_b64", None)
+        bbox = slim.get("bbox")
+        slim["bubble_id"] = compute_bubble_id(
+            bbox, is_outside_text=slim.get("is_outside_text", False)
+        )
+        slim["ocr_text"] = (
+            ocr_texts[i] if i < len(ocr_texts) else slim.get("ocr_text", "")
+        )
+        slim_bubbles.append(slim)
+
+    payload = {
+        "version": 1,
+        "image_path": str(image_path),
+        "target_mode": target_mode,
+        "pil_cleaned_image": pil_cleaned_image,
+        "sorted_bubble_data": slim_bubbles,
+        "processed_bubbles_info": processed_bubbles_info,
+        "outside_text_data": outside_text_data,
+        "translation_config_snapshot": {
+            "output_language": config.translation.output_language,
+            "input_language": config.translation.input_language,
+        },
+    }
+
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, checkpoint_path)
+
+
+def load_manual_checkpoint(checkpoint_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a checkpoint previously written by save_manual_checkpoint."""
+    with open(checkpoint_path, "rb") as f:
+        return pickle.load(f)
+
+
+def _render_from_manual_checkpoint(
+    checkpoint_path: Union[str, Path],
+    manual_translations: Dict[str, str],
+    *,
+    output_path: Optional[Union[str, Path]],
+    config: MangaTranslatorConfig,
+    verbose: bool,
+) -> Image.Image:
+    """
+    Manual translation mode, Pass 2: load a checkpoint saved during Pass 1 and
+    render user-supplied translations onto the already-cleaned page image.
+
+    No detection, cleaning, or OCR runs here - only text layout/drawing
+    (render_text_skia) against the masks/colors captured in Pass 1.
+    """
+    checkpoint = load_manual_checkpoint(checkpoint_path)
+    pil_cleaned_image: Image.Image = checkpoint["pil_cleaned_image"]
+    sorted_bubble_data: List[Dict[str, Any]] = checkpoint["sorted_bubble_data"]
+    processed_bubbles_info: List[Dict[str, Any]] = checkpoint["processed_bubbles_info"]
+    target_mode: str = checkpoint.get("target_mode", pil_cleaned_image.mode)
+
+    if pil_cleaned_image.mode != target_mode:
+        pil_cleaned_image = pil_cleaned_image.convert(target_mode)
+
+    processing_scale = 1.0  # baked into the checkpointed masks/geometry already
+    main_min_font = scale_font_size(
+        config.rendering.min_font_size, processing_scale, minimum=4, maximum=256
+    )
+    main_max_font = scale_font_size(
+        config.rendering.max_font_size,
+        processing_scale,
+        minimum=main_min_font,
+        maximum=384,
+    )
+    padding_pixels = scale_scalar(
+        config.rendering.padding_pixels, processing_scale, minimum=1.0, maximum=80.0
+    )
+    osb_min_font = scale_font_size(
+        config.outside_text.osb_min_font_size,
+        processing_scale,
+        minimum=4,
+        maximum=512,
+    )
+    osb_max_font = scale_font_size(
+        config.outside_text.osb_max_font_size,
+        processing_scale,
+        minimum=osb_min_font,
+        maximum=640,
+    )
+    osb_outline_width = scale_scalar(
+        config.outside_text.osb_outline_width,
+        processing_scale,
+        minimum=0.0,
+        maximum=24.0,
+    )
+
+    bubble_render_info_map = {
+        tuple(info["bbox"]): {
+            "color": info["color"],
+            "mask": info.get("mask"),
+            "base_mask": info.get("base_mask"),
+            "is_sam": info.get("is_sam", False),
+            "is_colored": info.get("is_colored", False),
+            "text_bbox": info.get("text_bbox"),
+            "text_color_bgr": info.get("text_color_bgr"),
+        }
+        for info in processed_bubbles_info
+        if "bbox" in info and "color" in info and "mask" in info
+    }
+
+    original_cv_image = pil_to_cv2(pil_cleaned_image)
+    missing_bubble_ids: List[str] = []
+    final_image_to_save = pil_cleaned_image
+
+    for i, bubble in enumerate(sorted_bubble_data):
+        bbox = bubble["bbox"]
+        is_outside_text = bubble.get("is_outside_text", False)
+        bubble_id = bubble.get("bubble_id") or compute_bubble_id(bbox, is_outside_text)
+        ocr_text = (bubble.get("ocr_text") or "").strip()
+
+        text = (manual_translations.get(bubble_id) or "").strip()
+        if not text:
+            # Fall back to the original OCR text so the page still renders in
+            # full even if this bubble's translation is missing/unmatched.
+            if bubble_id not in manual_translations:
+                missing_bubble_ids.append(bubble_id)
+            text = ocr_text
+        if not text:
+            log_message(
+                f"Skipping {bbox} - no translation and no OCR fallback text",
+                verbose=verbose,
+            )
+            continue
+        bubble["translation"] = text
+
+        render_info = None
+        base_mask = None
+        is_sam_mask = False
+        text_bg_rgb = None
+
+        if is_outside_text:
+            if ocr_text and ocr_text == text and "original_crop_pil" in bubble:
+                rendered_image = pil_cleaned_image.copy()
+                original_patch = bubble["original_crop_pil"]
+                rendered_image.paste(original_patch, (bbox[0], bbox[1]))
+                pil_cleaned_image = rendered_image
+                final_image_to_save = pil_cleaned_image
+                continue
+            text = text.upper()
+            font_dir = (
+                config.outside_text.osb_font_dir
+                if config.outside_text.osb_font_dir
+                else config.rendering.font_dir
+            )
+            min_font = osb_min_font
+            max_font = osb_max_font
+            line_spacing = config.outside_text.osb_line_spacing
+            use_ligs = config.outside_text.osb_use_ligatures
+            cleaned_mask = None
+            is_dark_text = bubble.get("is_dark_text", True)
+            text_color_rgb = bubble.get("text_color_rgb", None)
+            bubble_color_bgr = (50, 50, 50) if is_dark_text else (255, 255, 255)
+            rotation_deg = 0.0
+            vertical_stack = False
+            if bubble.get("needs_text_background"):
+                if text_color_rgb:
+                    lum = (
+                        0.299 * text_color_rgb[0]
+                        + 0.587 * text_color_rgb[1]
+                        + 0.114 * text_color_rgb[2]
+                    )
+                    text_bg_rgb = (255, 255, 255) if lum < 128 else (0, 0, 0)
+                else:
+                    text_bg_rgb = (0, 0, 0) if is_dark_text else (255, 255, 255)
+        else:
+            font_dir = config.rendering.font_dir
+            min_font = main_min_font
+            max_font = main_max_font
+            line_spacing = config.rendering.line_spacing_mult
+            use_ligs = config.rendering.use_ligatures
+            render_info = bubble_render_info_map.get(tuple(bbox))
+            bubble_color_bgr = (255, 255, 255)
+            cleaned_mask = None
+            text_color_rgb = None
+            if render_info:
+                bubble_color_bgr = render_info["color"]
+                cleaned_mask = render_info.get("mask")
+                base_mask = render_info.get("base_mask")
+                is_sam_mask = render_info.get("is_sam", False)
+                text_color_bgr_val = render_info.get("text_color_bgr")
+                if text_color_bgr_val:
+                    text_color_rgb = (
+                        text_color_bgr_val[2],
+                        text_color_bgr_val[1],
+                        text_color_bgr_val[0],
+                    )
+            vertical_stack = False
+            rotation_deg = 0.0
+
+        should_hyphenate = config.rendering.hyphenate_before_scaling
+        if not supports_long_word_breaking(config.translation.output_language):
+            should_hyphenate = False
+
+        render_config = RenderingConfig(
+            min_font_size=min_font,
+            max_font_size=max_font,
+            line_spacing_mult=line_spacing,
+            use_subpixel_rendering=(
+                config.outside_text.osb_use_subpixel_rendering
+                if is_outside_text
+                else config.rendering.use_subpixel_rendering
+            ),
+            font_hinting=(
+                config.outside_text.osb_font_hinting
+                if is_outside_text
+                else config.rendering.font_hinting
+            ),
+            use_ligatures=use_ligs,
+            hyphenate_before_scaling=should_hyphenate,
+            hyphen_penalty=config.rendering.hyphen_penalty,
+            hyphenation_min_word_length=config.rendering.hyphenation_min_word_length,
+            badness_exponent=config.rendering.badness_exponent,
+            padding_pixels=padding_pixels,
+            outline_width=osb_outline_width if is_outside_text else 0.0,
+            supersampling_factor=config.rendering.supersampling_factor,
+            detach_trailing_punctuation=config.rendering.detach_trailing_punctuation,
+            auto_vertical_text=(
+                False if is_outside_text else config.rendering.auto_vertical_text
+            ),
+        )
+
+        success = False
+        try:
+            rendered_image = render_text_skia(
+                pil_image=pil_cleaned_image,
+                text=text,
+                bbox=bbox,
+                font_dir=font_dir,
+                cleaned_mask=cleaned_mask,
+                bubble_color_bgr=bubble_color_bgr,
+                config=render_config,
+                verbose=verbose,
+                bubble_id=str(i + 1),
+                rotation_deg=rotation_deg,
+                vertical_stack=vertical_stack,
+                text_color_rgb=text_color_rgb,
+                raise_on_safe_error=not is_outside_text,
+                text_background_color=text_bg_rgb if is_outside_text else None,
+            )
+            success = True
+        except Exception as e:
+            log_message(f"Text rendering failed for {bbox}: {e}", verbose=verbose)
+            retry_result = None
+            if not is_outside_text and "Safe area calculation failed" in str(e):
+                retry_result = retry_cleaning_with_otsu(
+                    original_cv_image,
+                    {
+                        "base_mask": base_mask,
+                        "bbox": bbox,
+                        "is_sam": is_sam_mask,
+                        "is_colored": (
+                            render_info.get("is_colored", False)
+                            if render_info
+                            else False
+                        ),
+                        "text_bbox": (
+                            render_info.get("text_bbox") if render_info else None
+                        ),
+                        "text_color_bgr": (
+                            render_info.get("text_color_bgr") if render_info else None
+                        ),
+                    },
+                    config.cleaning.thresholding_value,
+                    config.cleaning.roi_shrink_px,
+                    processing_scale,
+                    verbose=verbose,
+                    classify_colored=config.cleaning.inpaint_colored_bubbles,
+                )
+            if retry_result and retry_result.get("mask") is not None:
+                try:
+                    rendered_image = render_text_skia(
+                        pil_image=pil_cleaned_image,
+                        text=text,
+                        bbox=bbox,
+                        font_dir=font_dir,
+                        cleaned_mask=retry_result["mask"],
+                        bubble_color_bgr=retry_result.get("color", bubble_color_bgr),
+                        config=render_config,
+                        verbose=verbose,
+                        bubble_id=str(i + 1),
+                        rotation_deg=rotation_deg,
+                        vertical_stack=vertical_stack,
+                        raise_on_safe_error=False,
+                    )
+                    success = True
+                except Exception as e2:
+                    log_message(
+                        f"Text rendering failed after Otsu retry: {e2}",
+                        verbose=verbose,
+                    )
+                    rendered_image = pil_cleaned_image
+                    success = False
+            elif is_outside_text and "original_crop_pil" in bubble:
+                rendered_image = pil_cleaned_image.copy()
+                original_patch = bubble["original_crop_pil"]
+                rendered_image.paste(original_patch, (bbox[0], bbox[1]))
+                success = True
+            else:
+                rendered_image = pil_cleaned_image
+                success = False
+
+        if success:
+            pil_cleaned_image = rendered_image
+            final_image_to_save = pil_cleaned_image
+        else:
+            log_message(f"Failed to render bubble {bbox}", verbose=verbose)
+
+    if missing_bubble_ids:
+        log_message(
+            f"Manual mode: {len(missing_bubble_ids)} bubble(s) had no translation "
+            f"in the supplied JSON, kept original OCR text: {missing_bubble_ids}",
+            always_print=True,
+        )
+
+    if config.output.upscale_final_image:
+        final_image_to_save = upscale_image(
+            final_image_to_save,
+            config.output.image_upscale_factor,
+            model_type=config.output.image_upscale_model,
+            verbose=verbose,
+        )
+
+    if output_path:
+        if final_image_to_save.mode != target_mode:
+            final_image_to_save = final_image_to_save.convert(target_mode)
+        try:
+            save_image_with_compression(
+                final_image_to_save,
+                output_path,
+                jpeg_quality=config.output.jpeg_quality,
+                png_compression=config.output.png_compression,
+                verbose=verbose,
+            )
+        except ImageProcessingError as e:
+            log_message(f"Failed to save image: {e}", always_print=True)
+            raise
+
+    return final_image_to_save
+
+
 def _natural_text_sort_key(text: str) -> Tuple[Tuple[int, Union[int, str], str], ...]:
     return tuple(
         (0, int(part), part) if part.isdigit() else (1, part.lower(), part)
@@ -140,6 +541,24 @@ def _natural_text_sort_key(text: str) -> Tuple[Tuple[int, Union[int, str], str],
 
 def _natural_path_sort_key(path: Path):
     return tuple(_natural_text_sort_key(part) for part in path.parts)
+
+
+def list_manual_mode_images(input_dir: Union[str, Path]) -> List[Path]:
+    """
+    List images in a directory in the same natural, page-number-aware order
+    used by batch_translate_images. Used by Manual mode's Pass 1/Pass 2 CLI
+    loops in main.py so page ordering (and therefore the combined JSON's
+    page order) matches what a normal --batch run would produce.
+    """
+    input_dir = Path(input_dir)
+    image_extensions = [".jpg", ".jpeg", ".png", ".webp"]
+    image_files = [
+        f
+        for f in input_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in image_extensions
+    ]
+    image_files.sort(key=lambda p: _natural_path_sort_key(Path(p.name)))
+    return image_files
 
 
 def _debug_mask_bbox(mask):
@@ -644,6 +1063,9 @@ def translate_and_render(
     previous_context_texts: Optional[List[List[str]]] = None,
     previous_context_texts_provider: Optional[Callable[[], List[List[str]]]] = None,
     ocr_texts_out: Optional[List[str]] = None,
+    manual_checkpoint_save_path: Optional[Union[str, Path]] = None,
+    manual_checkpoint_load_path: Optional[Union[str, Path]] = None,
+    manual_translations: Optional[Dict[str, str]] = None,
 ):
     """
     Main function to translate manga speech bubbles and render translations using a config object.
@@ -660,10 +1082,33 @@ def translate_and_render(
         ocr_texts_out: Optional mutable list. When provided, the current page's OCR transcripts
             (in reading order) are appended so the orchestrator can chain them as previous-page
             text context for subsequent pages.
+        manual_checkpoint_save_path: Manual translation mode, Pass 1. When provided, detection,
+            cleaning, and OCR (transcription only - no translation API call) run as normal, the
+            resulting state (cleaned image, bubble geometry/masks, per-bubble OCR text) is
+            pickled to this path, and the function returns early with the cleaned-but-untranslated
+            image. Rendering is skipped entirely in this pass.
+        manual_checkpoint_load_path: Manual translation mode, Pass 2. When provided, detection,
+            cleaning, and OCR are skipped entirely; the checkpoint written via
+            manual_checkpoint_save_path is loaded from this path and rendering resumes directly
+            from it using `manual_translations`. All other args except `output_path` and
+            `manual_translations` are ignored in this mode.
+        manual_translations: Manual translation mode, Pass 2. Mapping of bubble_id -> translated
+            text (see compute_bubble_id / the "bubble_id" field written into each checkpoint
+            bubble entry). A bubble whose id is missing or has empty text falls back to that
+            bubble's captured OCR text (untranslated) so the page still renders in full.
 
     Returns:
         PIL.Image: Final translated image
     """
+    if manual_checkpoint_load_path is not None:
+        return _render_from_manual_checkpoint(
+            manual_checkpoint_load_path,
+            manual_translations or {},
+            output_path=output_path,
+            config=config,
+            verbose=getattr(config, "verbose", False),
+        )
+
     start_time = time.time()
     validate_config(config)
     image_path = Path(image_path)
@@ -1090,6 +1535,40 @@ def translate_and_render(
                     "No valid bubble images or outside text for translation",
                     always_print=True,
                 )
+                if manual_checkpoint_save_path is not None:
+                    save_manual_checkpoint(
+                        manual_checkpoint_save_path,
+                        pil_cleaned_image=pil_cleaned_image,
+                        sorted_bubble_data=[],
+                        processed_bubbles_info=processed_bubbles_info,
+                        outside_text_data=[],
+                        ocr_texts=[],
+                        target_mode=target_mode,
+                        image_path=image_path,
+                        config=config,
+                    )
+                    if output_path:
+                        final_to_save = pil_cleaned_image
+                        if final_to_save.mode != target_mode:
+                            final_to_save = final_to_save.convert(target_mode)
+                        try:
+                            save_image_with_compression(
+                                final_to_save,
+                                output_path,
+                                jpeg_quality=config.output.jpeg_quality,
+                                png_compression=config.output.png_compression,
+                                verbose=verbose,
+                            )
+                        except ImageProcessingError as e:
+                            log_message(
+                                f"Failed to save cleaned preview image: {e}",
+                                always_print=True,
+                            )
+                    log_message(
+                        "Manual mode Pass 1 checkpoint saved (no bubbles on this page)",
+                        always_print=True,
+                    )
+                    return pil_cleaned_image
                 if use_llm_inpaint_overlap and (
                     outside_work is not None or bubble_data
                 ):
@@ -1270,6 +1749,64 @@ def translate_and_render(
                     for bubble in sorted_bubble_data
                     if "image_b64" in bubble and "mime_type" in bubble
                 ]
+
+                if manual_checkpoint_save_path is not None:
+                    # Manual translation mode, Pass 1: run OCR only (no translation
+                    # API call), then checkpoint everything Pass 2 needs and stop
+                    # before rendering. Detection/cleaning above already ran once;
+                    # this is the only extra network call this pass makes.
+                    manual_ocr_texts: List[str] = []
+                    if bubble_images_b64:
+                        try:
+                            manual_ocr_texts = perform_ocr_only_batch(
+                                config=config.translation,
+                                images_b64=bubble_images_b64,
+                                mime_types=bubble_mime_types,
+                                bubble_metadata=sorted_bubble_data,
+                                debug=verbose,
+                            )
+                        except Exception as e:
+                            log_message(
+                                f"Manual mode OCR failed: {e}", always_print=True
+                            )
+                            manual_ocr_texts = ["[OCR FAILED]"] * len(
+                                bubble_images_b64
+                            )
+                    save_manual_checkpoint(
+                        manual_checkpoint_save_path,
+                        pil_cleaned_image=pil_cleaned_image,
+                        sorted_bubble_data=sorted_bubble_data,
+                        processed_bubbles_info=processed_bubbles_info,
+                        outside_text_data=outside_text_data,
+                        ocr_texts=manual_ocr_texts,
+                        target_mode=target_mode,
+                        image_path=image_path,
+                        config=config,
+                    )
+                    if output_path:
+                        final_to_save = pil_cleaned_image
+                        if final_to_save.mode != target_mode:
+                            final_to_save = final_to_save.convert(target_mode)
+                        try:
+                            save_image_with_compression(
+                                final_to_save,
+                                output_path,
+                                jpeg_quality=config.output.jpeg_quality,
+                                png_compression=config.output.png_compression,
+                                verbose=verbose,
+                            )
+                        except ImageProcessingError as e:
+                            log_message(
+                                f"Failed to save cleaned preview image: {e}",
+                                always_print=True,
+                            )
+                    log_message(
+                        "Manual mode Pass 1 checkpoint saved "
+                        f"({len(manual_ocr_texts)} bubble(s) OCR'd)",
+                        always_print=True,
+                    )
+                    return pil_cleaned_image
+
                 translated_texts = []
                 current_ocr_texts: List[str] = []
                 _provider_tag = f"[{config.translation.provider}:"
