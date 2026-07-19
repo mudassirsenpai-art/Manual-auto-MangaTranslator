@@ -8,6 +8,17 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+# Belt-and-suspenders alongside the OMP_NUM_THREADS/MKL_NUM_THREADS env vars
+# set by the caller (bot.py): explicitly cap torch's own intra-op thread
+# pool too, since env vars only reliably affect native BLAS libraries and
+# may be ignored if torch was already imported elsewhere before they were
+# read. Thread oversubscription on small/shared CPU runners is a known
+# cause of model.generate() appearing to hang indefinitely.
+try:
+    torch.set_num_threads(int(os.environ.get("BOT_CPU_THREADS", "2")))
+except Exception:
+    pass
 from huggingface_hub import hf_hub_download, snapshot_download
 from spandrel import ModelLoader
 from transformers import (
@@ -949,9 +960,22 @@ class ModelManager:
                 model_path_str, token=token, backend="torchvision"
             )
 
-            # Prefer flash_attention_2 on CUDA, fall back to sdpa on Windows/CPU
+            # Prefer flash_attention_2 on CUDA. On CPU we deliberately skip
+            # "sdpa": PyTorch's CPU scaled_dot_product_attention kernel has
+            # a known class of pathological hangs/near-infinite stalls during
+            # generate() on some CPU builds/thread configs (loads fine, then
+            # never returns from the forward pass) - unlike a normal slowdown,
+            # this doesn't reliably resolve with more time. "eager" is the
+            # plain, well-tested attention path; for the short prompts used
+            # here (single OCR bubble) the CPU cost difference vs sdpa is
+            # negligible, and it doesn't carry this hang risk.
+            attn_candidates = (
+                ("flash_attention_2", "sdpa", "eager")
+                if self.device.type == "cuda"
+                else ("eager",)
+            )
             dtype = self.dtype if self.device.type == "cuda" else None
-            for attn_impl in ("flash_attention_2", "sdpa", "eager"):
+            for attn_impl in attn_candidates:
                 try:
                     model = (
                         AutoModelForImageTextToText.from_pretrained(
@@ -968,7 +992,7 @@ class ModelManager:
                     )
                     break
                 except (ImportError, ValueError, RuntimeError):
-                    if attn_impl == "eager":
+                    if attn_impl == attn_candidates[-1]:
                         raise
                     log_message(
                         f"PaddleOCR-VL-1.6: {attn_impl} unavailable, trying fallback",
