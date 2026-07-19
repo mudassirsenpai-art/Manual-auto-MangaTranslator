@@ -1428,6 +1428,82 @@ def _perform_llm_ocr(
     return extracted_texts
 
 
+def perform_ocr_only_batch(
+    config: TranslationConfig,
+    images_b64: List[str],
+    mime_types: List[str],
+    bubble_metadata: List[Dict[str, Any]],
+    debug: bool = False,
+) -> List[str]:
+    """
+    Run OCR only (no translation call) for a batch of text-element crops.
+
+    This mirrors the OCR sub-step of the "two-step" translation_mode branch in
+    call_translation_api_batch, but stops right after transcription so callers
+    (e.g. Manual translation mode) can capture the original-language text
+    without spending a translation API call.
+
+    Args:
+        config: TranslationConfig (provider/model/ocr_method settings apply).
+        images_b64: List of base64-encoded text-element crops, in reading order.
+        mime_types: MIME type for each crop.
+        bubble_metadata: Metadata dicts (only used for parity with the batch
+            translation call signature; not required to have translation-only
+            fields populated).
+        debug: Verbose logging toggle.
+
+    Returns:
+        List of transcribed strings (source-language text), one per input
+        image, in the same order as images_b64. On OCR failure for an item,
+        returns the placeholder "[OCR FAILED]" for that item.
+    """
+    import uuid
+
+    provider = config.provider
+    input_language = config.input_language
+    reading_direction = config.reading_direction
+    session_prompt_cache_key = f"manga-ocr-only-{uuid.uuid4()}"
+
+    if not images_b64:
+        return []
+
+    if config.ocr_method == "manga-ocr":
+        extracted_texts = _perform_manga_ocr(images_b64, bubble_metadata, debug)
+    elif config.ocr_method == "paddleocr-vl-1.6":
+        extracted_texts = _perform_paddle_ocr_vl(images_b64, bubble_metadata, debug)
+    else:
+        special_instructions_section = _format_special_instructions(config)
+        ocr_prompt = f"""
+## CONTEXT
+You have been provided with {len(images_b64)} individual text images from a manga page.
+
+## TASK
+Apply your OCR transcription rules to each image provided.{special_instructions_section}
+"""  # noqa
+        extracted_texts = _perform_llm_ocr(
+            config,
+            images_b64,
+            mime_types,
+            ocr_prompt,
+            provider,
+            input_language,
+            reading_direction,
+            debug,
+            prompt_cache_key=session_prompt_cache_key,
+        )
+
+    # Normalize provider-tagged failure strings to the standard placeholder so
+    # downstream consumers only need to check for one sentinel value.
+    normalized_texts = []
+    for text in extracted_texts:
+        if f"[{provider}-OCR:" in text or f"[{provider}:" in text:
+            normalized_texts.append("[OCR FAILED]")
+        else:
+            normalized_texts.append(text)
+
+    return normalized_texts
+
+
 def call_translation_api_batch(
     config: TranslationConfig,
     images_b64: List[str],
