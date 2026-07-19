@@ -57,7 +57,7 @@ def get_available_providers(ocr_method: str) -> List[str]:
     """Get list of available providers based on OCR method."""
     all_providers = list(PROVIDER_MODELS.keys())
 
-    if ocr_method in ("manga-ocr", "paddleocr-vl-1.6"):
+    if ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "surya-ocr", "paddleocr-classic"):
         return all_providers
     else:
         # For LLM OCR, exclude text-only providers (DeepSeek)
@@ -1333,7 +1333,7 @@ def fetch_and_update_openrouter_models(
             output_modalities = []
         output_modalities_lc = [str(m).lower() for m in output_modalities]
 
-        if ocr_method in ("manga-ocr", "paddleocr-vl-1.6"):
+        if ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "surya-ocr", "paddleocr-classic"):
             # For local OCR: require text input and text output
             if "text" in input_modalities_lc and "text" in output_modalities_lc:
                 filtered_models.append(model["id"])
