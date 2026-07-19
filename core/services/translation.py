@@ -12,8 +12,10 @@ from core.caching import get_cache
 from core.config import TranslationConfig, calculate_reasoning_budget
 from core.image.image_utils import cv2_to_pil, pil_to_cv2, process_bubble_image_cached
 from core.image.ocr_detection import (
+    extract_text_with_classic_paddleocr,
     extract_text_with_manga_ocr,
     extract_text_with_paddle_ocr_vl,
+    extract_text_with_surya_ocr,
 )
 from utils.endpoints import (
     call_anthropic_endpoint,
@@ -69,6 +71,15 @@ TRANSLATION_PATTERN = re.compile(
     r'^\s*(\d+)\s*:\s*"?\s*(.*?)\s*"?\s*(?=\s*\n\s*\d+\s*:|\s*$)',
     re.MULTILINE | re.DOTALL,
 )
+
+# ocr_method values that run entirely locally (no vision LLM call for the OCR
+# step). These share two behaviors that vision-LLM OCR does not: (1) no
+# full-page context image is attached, since these models only ever see the
+# individual cropped text-element images, and (2) they never need the
+# LLM-oriented OCR transcription prompt. Kept as one set so every ocr_method
+# added here only needs updating in one place instead of two duplicated
+# tuples.
+LOCAL_OCR_METHODS = ("manga-ocr", "paddleocr-vl-1.6", "surya-ocr", "paddleocr-classic")
 
 
 def _build_system_prompt_ocr(
@@ -1361,6 +1372,159 @@ def _perform_paddle_ocr_vl(
     return extracted_texts
 
 
+def _perform_surya_ocr(
+    images_b64: List[str],
+    bubble_metadata: List[Dict[str, Any]],
+    input_language: Optional[str] = None,
+    debug: bool = False,
+) -> List[str]:
+    """Perform OCR using Surya OCR (multi-language: Japanese/Korean/Chinese/English).
+
+    Args:
+        images_b64: List of base64-encoded images
+        bubble_metadata: List of metadata dicts for text elements
+        input_language: Source language hint, forwarded to narrow Surya's
+            recognition language list (falls back to all CJK+English when
+            unset/"auto")
+        debug: Whether to print verbose logging
+
+    Returns:
+        List of extracted text strings, or early return with failure list
+    """
+    total_elements = len(images_b64)
+    log_message("Using Surya OCR for text extraction", verbose=debug)
+
+    cache = get_cache()
+    cache_key = cache.get_manga_ocr_cache_key(
+        images_b64, total_elements, prefix=f"surya_{input_language or 'auto'}_"
+    )
+    cached_ocr = cache.get_manga_ocr_result(cache_key)
+    if cached_ocr is not None:
+        if len(cached_ocr) == total_elements:
+            log_message("Using cached Surya OCR results", verbose=debug)
+            return cached_ocr
+        log_message("Discarding Surya OCR cache due to length mismatch", verbose=debug)
+
+    pil_images = _prepare_images_for_ocr(images_b64, verbose=debug)
+    extracted_texts = extract_text_with_surya_ocr(
+        pil_images, input_language=input_language, verbose=debug
+    )
+
+    formatted_texts = []
+    for i, text in enumerate(extracted_texts):
+        if text == "[OCR FAILED]" or not text:
+            formatted_texts.append(text if text else "[OCR FAILED]")
+        else:
+            formatted_texts.append(text)
+
+    extracted_texts = formatted_texts
+
+    _format_ocr_results(extracted_texts, bubble_metadata)
+
+    if len(extracted_texts) != total_elements:
+        msg = (
+            f"Warning: extracted_texts length ({len(extracted_texts)}) "
+            f"doesn't match total_elements ({total_elements})"
+        )
+        log_message(msg, always_print=True)
+        while len(extracted_texts) < total_elements:
+            extracted_texts.append("[OCR FAILED]")
+        extracted_texts = extracted_texts[:total_elements]
+
+    if not extracted_texts:
+        log_message("Surya OCR returned empty results", verbose=debug)
+        failure_results = ["[OCR FAILED]"] * total_elements
+        cache.set_manga_ocr_result(cache_key, failure_results, debug)
+        return failure_results
+
+    if _check_ocr_failure(extracted_texts):
+        log_message("Surya OCR returned only failures", verbose=debug)
+        cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+        return extracted_texts
+
+    cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+    return extracted_texts
+
+
+def _perform_paddleocr_classic(
+    images_b64: List[str],
+    bubble_metadata: List[Dict[str, Any]],
+    input_language: Optional[str] = None,
+    debug: bool = False,
+) -> List[str]:
+    """Perform OCR using classic PaddleOCR (PP-OCRv4, NOT the PaddleOCR-VL VLM).
+
+    Args:
+        images_b64: List of base64-encoded images
+        bubble_metadata: List of metadata dicts for text elements
+        input_language: Source language hint, selects which PP-OCRv4
+            language model to run (falls back to trying Japanese/Korean/
+            Chinese per image when unset/"auto")
+        debug: Whether to print verbose logging
+
+    Returns:
+        List of extracted text strings, or early return with failure list
+    """
+    total_elements = len(images_b64)
+    log_message("Using PaddleOCR (Classic) for text extraction", verbose=debug)
+
+    cache = get_cache()
+    cache_key = cache.get_manga_ocr_cache_key(
+        images_b64,
+        total_elements,
+        prefix=f"pocrcls_{input_language or 'auto'}_",
+    )
+    cached_ocr = cache.get_manga_ocr_result(cache_key)
+    if cached_ocr is not None:
+        if len(cached_ocr) == total_elements:
+            log_message("Using cached PaddleOCR (Classic) results", verbose=debug)
+            return cached_ocr
+        log_message(
+            "Discarding PaddleOCR (Classic) cache due to length mismatch",
+            verbose=debug,
+        )
+
+    pil_images = _prepare_images_for_ocr(images_b64, verbose=debug)
+    extracted_texts = extract_text_with_classic_paddleocr(
+        pil_images, input_language=input_language, verbose=debug
+    )
+
+    formatted_texts = []
+    for i, text in enumerate(extracted_texts):
+        if text == "[OCR FAILED]" or not text:
+            formatted_texts.append(text if text else "[OCR FAILED]")
+        else:
+            formatted_texts.append(" ".join(text.split()))
+
+    extracted_texts = formatted_texts
+
+    _format_ocr_results(extracted_texts, bubble_metadata)
+
+    if len(extracted_texts) != total_elements:
+        msg = (
+            f"Warning: extracted_texts length ({len(extracted_texts)}) "
+            f"doesn't match total_elements ({total_elements})"
+        )
+        log_message(msg, always_print=True)
+        while len(extracted_texts) < total_elements:
+            extracted_texts.append("[OCR FAILED]")
+        extracted_texts = extracted_texts[:total_elements]
+
+    if not extracted_texts:
+        log_message("PaddleOCR (Classic) returned empty results", verbose=debug)
+        failure_results = ["[OCR FAILED]"] * total_elements
+        cache.set_manga_ocr_result(cache_key, failure_results, debug)
+        return failure_results
+
+    if _check_ocr_failure(extracted_texts):
+        log_message("PaddleOCR (Classic) returned only failures", verbose=debug)
+        cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+        return extracted_texts
+
+    cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+    return extracted_texts
+
+
 def _perform_llm_ocr(
     config: TranslationConfig,
     images_b64: List[str],
@@ -1471,6 +1635,14 @@ def perform_ocr_only_batch(
         extracted_texts = _perform_manga_ocr(images_b64, bubble_metadata, debug)
     elif config.ocr_method == "paddleocr-vl-1.6":
         extracted_texts = _perform_paddle_ocr_vl(images_b64, bubble_metadata, debug)
+    elif config.ocr_method == "surya-ocr":
+        extracted_texts = _perform_surya_ocr(
+            images_b64, bubble_metadata, input_language, debug
+        )
+    elif config.ocr_method == "paddleocr-classic":
+        extracted_texts = _perform_paddleocr_classic(
+            images_b64, bubble_metadata, input_language, debug
+        )
     else:
         special_instructions_section = _format_special_instructions(config)
         ocr_prompt = f"""
@@ -1682,6 +1854,20 @@ Apply your OCR transcription rules to each image provided.{special_instructions_
                     bubble_metadata,
                     debug,
                 )
+            elif config.ocr_method == "surya-ocr":
+                extracted_texts = _perform_surya_ocr(
+                    images_b64,
+                    bubble_metadata,
+                    input_language,
+                    debug,
+                )
+            elif config.ocr_method == "paddleocr-classic":
+                extracted_texts = _perform_paddleocr_classic(
+                    images_b64,
+                    bubble_metadata,
+                    input_language,
+                    debug,
+                )
             else:
                 extracted_texts = _perform_llm_ocr(
                     config,
@@ -1715,7 +1901,7 @@ Apply your OCR transcription rules to each image provided.{special_instructions_
             full_page_context = (
                 "A full-page image is also provided for visual and narrative context."
                 if (
-                    config.ocr_method not in ("manga-ocr", "paddleocr-vl-1.6")
+                    config.ocr_method not in LOCAL_OCR_METHODS
                     and config.send_full_page_context
                     and full_image_b64
                 )
@@ -1746,7 +1932,7 @@ The target language is {output_language}. Use the appropriate translation approa
 
             translation_parts = []
             if (
-                config.ocr_method not in ("manga-ocr", "paddleocr-vl-1.6")
+                config.ocr_method not in LOCAL_OCR_METHODS
                 and config.send_full_page_context
                 and full_image_b64
             ):
