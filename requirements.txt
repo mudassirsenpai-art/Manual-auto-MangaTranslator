@@ -20,3 +20,16 @@ torchvision
 transformers>=5.0.0
 uharfbuzz>=0.48.0
 ultralytics>=8.3.94
+# surya-ocr: pinned below 0.18 to stay on the pre-"Surya 2" API
+# (FoundationPredictor/RecognitionPredictor/DetectionPredictor), which runs
+# purely on local torch. 0.18+ ("Surya 2") requires a running vllm or
+# llama.cpp inference-server backend, which is unsuitable for a CPU-only
+# Actions runner - do not upgrade past this without re-checking that.
+surya-ocr>=0.14.0,<0.18.0
+# paddleocr: classic PP-OCRv4 OCR (paddleocr-classic method), NOT the
+# PaddleOCR-VL VLM used by the paddleocr-vl-1.6 method. Also requires the
+# hardware-specific `paddlepaddle` package (CPU/GPU build), which - like
+# torch - is intentionally not listed here and must be installed separately
+# for the target hardware (see the bot repo's CI workflow for the CPU
+# install command).
+paddleocr>=2.7.0
