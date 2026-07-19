@@ -42,6 +42,8 @@ class ModelType(Enum):
     SAM3 = "sam3"
     MANGA_OCR = "manga_ocr"
     PADDLE_OCR_VL = "paddle_ocr_vl"
+    SURYA_OCR = "surya_ocr"
+    PADDLEOCR_CLASSIC = "paddleocr_classic"
     FLUX_TRANSFORMER = "flux_transformer"
     FLUX_TEXT_ENCODER = "flux_text_encoder"
     FLUX_PIPELINE = "flux_pipeline"
@@ -979,6 +981,92 @@ class ModelManager:
             log_message("PaddleOCR-VL-1.6 initialized.", verbose=verbose)
             return self.models[ModelType.PADDLE_OCR_VL]
 
+    def get_surya_ocr(self, verbose: bool = False):
+        """Get Surya OCR (foundation_predictor, recognition_predictor,
+        detection_predictor) tuple, loading it if necessary.
+
+        Surya downloads and caches its own model weights on first use (via
+        its internal Hugging Face download logic, not through
+        `_ensure_hf_repo`), so there is no separate `load_surya_ocr()`
+        pre-download step here - the predictors are constructed lazily on
+        first call, same as manga-ocr's underlying library does.
+
+        Args:
+            verbose: Whether to print verbose logging
+
+        Returns:
+            Tuple of (FoundationPredictor, RecognitionPredictor, DetectionPredictor)
+        """
+        with self._lock:
+            if self.is_loaded(ModelType.SURYA_OCR):
+                return self.models[ModelType.SURYA_OCR]
+
+            log_message("Initializing Surya OCR...", verbose=verbose)
+
+            if "TORCH_DEVICE" not in os.environ:
+                os.environ["TORCH_DEVICE"] = self.device.type
+
+            from surya.detection import DetectionPredictor
+            from surya.foundation import FoundationPredictor
+            from surya.recognition import RecognitionPredictor
+
+            foundation_predictor = FoundationPredictor()
+            recognition_predictor = RecognitionPredictor(foundation_predictor)
+            detection_predictor = DetectionPredictor()
+
+            self.models[ModelType.SURYA_OCR] = (
+                foundation_predictor,
+                recognition_predictor,
+                detection_predictor,
+            )
+            log_message("Surya OCR initialized.", verbose=verbose)
+            return self.models[ModelType.SURYA_OCR]
+
+    def get_paddleocr_classic(self, lang: str = "japan", verbose: bool = False):
+        """Get a classic PaddleOCR (PP-OCRv4, detection+recognition, NOT the
+        PaddleOCR-VL VLM) instance for the given language, loading it if
+        necessary. A separate instance is cached per language since PP-OCRv4
+        recognition models are monolingual, unlike PaddleOCR-VL or Surya.
+
+        Args:
+            lang: PaddleOCR language identifier - "japan", "korean", "ch",
+                or "en" (see _PADDLE_CLASSIC_LANG_CODES in ocr_detection.py).
+            verbose: Whether to print verbose logging
+
+        Returns:
+            A PaddleOCR instance configured for the requested language.
+        """
+        with self._lock:
+            cache = self.models.get(ModelType.PADDLEOCR_CLASSIC)
+            if cache is None:
+                cache = {}
+                self.models[ModelType.PADDLEOCR_CLASSIC] = cache
+
+            if lang in cache and cache[lang] is not None:
+                return cache[lang]
+
+            log_message(
+                f"Initializing PaddleOCR (Classic, PP-OCRv4, lang={lang})...",
+                verbose=verbose,
+            )
+
+            from paddleocr import PaddleOCR
+
+            ocr_instance = PaddleOCR(
+                lang=lang,
+                ocr_version="PP-OCRv4",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+
+            cache[lang] = ocr_instance
+            log_message(
+                f"PaddleOCR (Classic, PP-OCRv4, lang={lang}) initialized.",
+                verbose=verbose,
+            )
+            return ocr_instance
+
     def load_sam2(self, verbose: bool = False):
         """Load SAM 2.1 model and processor.
 
@@ -1415,6 +1503,10 @@ class ModelManager:
             models_unloaded.append("manga_ocr")
         if self.is_loaded(ModelType.PADDLE_OCR_VL):
             models_unloaded.append("paddle_ocr_vl")
+        if self.is_loaded(ModelType.SURYA_OCR):
+            models_unloaded.append("surya_ocr")
+        if self.is_loaded(ModelType.PADDLEOCR_CLASSIC):
+            models_unloaded.append("paddleocr_classic")
 
         self.unload_model(ModelType.YOLO_SPEECH_BUBBLE, force_gc=False, verbose=verbose)
         self.unload_model(
@@ -1429,6 +1521,11 @@ class ModelManager:
         self.unload_model(ModelType.YOLO_PANEL, force_gc=False, verbose=verbose)
         self.unload_model(ModelType.MANGA_OCR, force_gc=True, verbose=verbose)
         self.unload_model(ModelType.PADDLE_OCR_VL, force_gc=True, verbose=verbose)
+        self.unload_model(ModelType.SURYA_OCR, force_gc=True, verbose=verbose)
+        # PADDLEOCR_CLASSIC stores a {lang: instance} dict rather than a
+        # single model object, but unload_model()'s is_loaded()/del handling
+        # works unchanged since it only checks the slot is non-None.
+        self.unload_model(ModelType.PADDLEOCR_CLASSIC, force_gc=True, verbose=verbose)
 
         if models_unloaded:
             log_message("OCR models unloaded.", verbose=verbose)
