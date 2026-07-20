@@ -88,6 +88,49 @@ def _mask_to_bbox(mask, fallback_box=None) -> tuple[int, int, int, int]:
     )
 
 
+def _sanitize_bbox(
+    x0: float, y0: float, x1: float, y1: float, img_w: int, img_h: int
+) -> tuple[int, int, int, int]:
+    """Clamp an xyxy box to image bounds and repair zero/negative-area boxes.
+
+    Raw detector output (YOLO/RT-DETR) can occasionally produce a box that
+    rounds to zero width or height, or that falls outside the image bounds
+    (e.g. at very low confidence thresholds). Rather than let a degenerate
+    box propagate downstream into an empty crop, expand it to a minimum
+    1px size here, at the point where the box is first built, so every
+    detection stored has a valid, non-empty bbox by construction.
+    """
+    ix0, iy0, ix1, iy1 = int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+
+    # Ensure ordering (x1 < x2, y1 < y2) in case of malformed input.
+    if ix1 < ix0:
+        ix0, ix1 = ix1, ix0
+    if iy1 < iy0:
+        iy0, iy1 = iy1, iy0
+
+    # Clamp to image bounds.
+    ix0 = max(0, min(ix0, img_w))
+    ix1 = max(0, min(ix1, img_w))
+    iy0 = max(0, min(iy0, img_h))
+    iy1 = max(0, min(iy1, img_h))
+
+    # Guarantee at least 1px of width/height, expanding within bounds.
+    if ix1 <= ix0:
+        if ix0 < img_w:
+            ix1 = ix0 + 1
+        elif ix0 > 0:
+            ix0 = ix0 - 1
+            ix1 = ix0 + 1
+    if iy1 <= iy0:
+        if iy0 < img_h:
+            iy1 = iy0 + 1
+        elif iy0 > 0:
+            iy0 = iy0 - 1
+            iy1 = iy0 + 1
+
+    return (ix0, iy0, ix1, iy1)
+
+
 def _text_box_meaningfully_matches_box(t_box, b_box) -> bool:
     """Return True when a text box meaningfully belongs to a bubble box."""
     intersection = _box_intersection_area(t_box, b_box)
@@ -1118,12 +1161,7 @@ def _build_segmentation_detections(
         x0_f, y0_f, x1_f, y1_f = box.tolist()
         detections.append(
             {
-                "bbox": (
-                    int(round(x0_f)),
-                    int(round(y0_f)),
-                    int(round(x1_f)),
-                    int(round(y1_f)),
-                ),
+                "bbox": _sanitize_bbox(x0_f, y0_f, x1_f, y1_f, img_w, img_h),
                 "confidence": conf,
                 "class": cls_name,
                 "sam_mask": sam_mask,
@@ -1179,9 +1217,7 @@ def _build_segmentation_detections(
         group_bboxes = []
         for b in group_boxes:
             bx0, by0, bx1, by1 = b.tolist() if hasattr(b, "tolist") else b
-            group_bboxes.append(
-                (int(round(bx0)), int(round(by0)), int(round(bx1)), int(round(by1)))
-            )
+            group_bboxes.append(_sanitize_bbox(bx0, by0, bx1, by1, img_w, img_h))
 
         for local_idx, s_idx in enumerate(s_indices):
             source, orig_idx = secondary_sources[s_idx]
@@ -1232,9 +1268,7 @@ def _build_segmentation_detections(
         group_bboxes = []
         for b in group_boxes:
             bx0, by0, bx1, by1 = b.tolist() if hasattr(b, "tolist") else b
-            group_bboxes.append(
-                (int(round(bx0)), int(round(by0)), int(round(bx1)), int(round(by1)))
-            )
+            group_bboxes.append(_sanitize_bbox(bx0, by0, bx1, by1, img_w, img_h))
 
         for local_idx, p_idx in enumerate(member_indices):
             source, orig_idx = primary_sources[p_idx]
