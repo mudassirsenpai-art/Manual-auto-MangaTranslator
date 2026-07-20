@@ -926,12 +926,11 @@ def extract_text_with_paddle_ocr_vl(
 
 # Maps the engine's free-text `input_language` (as forwarded via
 # --input-language, e.g. "Japanese", "ja", "Korean", "ko", "Chinese", "zh",
-# "auto") to the Surya language code(s) to pass as `langs` per image, and to
-# the classic-PaddleOCR `lang` model identifier to load. Falls back to a
-# multi-language guess (all three CJK languages) when the input language is
-# unset/unrecognized (e.g. "auto"), since manga/manhwa/manhua batches are
-# frequently mixed and callers would rather pay a small accuracy cost than
-# get an outright wrong-language load.
+# "auto") to the classic-PaddleOCR `lang` model identifier to load. Falls
+# back to a multi-language guess (all three CJK languages) when the input
+# language is unset/unrecognized (e.g. "auto"), since manga/manhwa/manhua
+# batches are frequently mixed and callers would rather pay a small accuracy
+# cost than get an outright wrong-language load.
 _CJK_LANGUAGE_ALIASES = {
     "japanese": "japanese",
     "ja": "japanese",
@@ -950,14 +949,6 @@ _CJK_LANGUAGE_ALIASES = {
     "english": "english",
     "en": "english",
     "eng": "english",
-}
-
-# Surya OCR language codes (ISO 639-1-ish, per surya.recognition.languages).
-_SURYA_LANG_CODES = {
-    "japanese": "ja",
-    "korean": "ko",
-    "chinese": "zh",
-    "english": "en",
 }
 
 # Classic PaddleOCR (PP-OCRv4) `lang=` model identifiers. Note PaddleOCR uses
@@ -982,94 +973,6 @@ def _normalize_input_language(input_language: Optional[str]) -> Optional[str]:
     return _CJK_LANGUAGE_ALIASES.get(key)
 
 
-def extract_text_with_surya_ocr(
-    images: List[Image.Image],
-    input_language: Optional[str] = None,
-    verbose: bool = False,
-) -> List[str]:
-    """Extract text from images using Surya OCR (datalab-to/surya).
-
-    Surya is a pure-PyTorch, multi-language (90+ languages, including
-    Japanese/Korean/Chinese/English) OCR model that runs entirely on CPU
-    without any external server/API, making it suitable for manga (JP),
-    manhwa (KR), and manhua (CN) alike.
-
-    Args:
-        images: List of PIL Images to process (RGB)
-        input_language: Source language hint (e.g. "Japanese", "ko", "auto").
-            Narrows Surya's recognition language list when recognized;
-            otherwise all three CJK languages + English are passed so mixed
-            batches (or unset/auto) still get sensible results.
-        verbose: Whether to print verbose output
-
-    Returns:
-        List of extracted text strings (one per image). Returns [OCR FAILED] on errors.
-    """
-    if not images:
-        return []
-
-    try:
-        model_manager = get_model_manager()
-        foundation_predictor, recognition_predictor, detection_predictor = (
-            model_manager.get_surya_ocr(verbose=verbose)
-        )
-
-        normalized_lang = _normalize_input_language(input_language)
-        if normalized_lang is not None:
-            langs = [_SURYA_LANG_CODES[normalized_lang]]
-        else:
-            # Unset/"auto"/unrecognized: let Surya's recognizer see all
-            # relevant scripts rather than guessing wrong and mistranslating.
-            langs = ["ja", "ko", "zh", "en"]
-
-        extracted_texts = []
-        for i, img in enumerate(images):
-            try:
-                if img is None:
-                    log_message(
-                        f"Image {i + 1} is None (decode failure), skipping",
-                        always_print=True,
-                    )
-                    extracted_texts.append("[OCR FAILED]")
-                    continue
-
-                log_message(
-                    f"Processing image {i + 1}/{len(images)} with Surya OCR",
-                    verbose=verbose,
-                )
-
-                predictions = recognition_predictor(
-                    [img],
-                    [langs],
-                    det_predictor=detection_predictor,
-                )
-
-                if not predictions:
-                    extracted_texts.append("")
-                    continue
-
-                page_result = predictions[0]
-                lines = [
-                    line.text.strip()
-                    for line in getattr(page_result, "text_lines", []) or []
-                    if getattr(line, "text", None) and line.text.strip()
-                ]
-                text = "\n".join(lines)
-                extracted_texts.append(text.strip() if text else "")
-
-            except Exception as e:
-                log_message(
-                    f"Surya OCR failed for image {i + 1}: {e}", always_print=True
-                )
-                extracted_texts.append("[OCR FAILED]")
-
-        return extracted_texts
-
-    except Exception as e:
-        log_message(f"Error with Surya OCR: {e}", always_print=True)
-        return ["[OCR FAILED]"] * len(images)
-
-
 def extract_text_with_classic_paddleocr(
     images: List[Image.Image],
     input_language: Optional[str] = None,
@@ -1087,8 +990,7 @@ def extract_text_with_classic_paddleocr(
             unrecognized (e.g. "auto"), each image is tried against
             Japanese, Korean, and Chinese models in turn and the result
             with the most recognized text lines is kept, since PP-OCRv4
-            (unlike Surya) does not support multiple recognition
-            languages in one pass.
+            does not support multiple recognition languages in one pass.
         verbose: Whether to print verbose output
 
     Returns:
