@@ -606,6 +606,7 @@ def main():
             "manga-ocr",
             "paddleocr-vl-1.6",
             "paddleocr-classic",
+            "paddleocr-classic-v5",
         ],
         help=(
             "Determines whether to use a vision-capable LLM or a local OCR model for OCR. "
