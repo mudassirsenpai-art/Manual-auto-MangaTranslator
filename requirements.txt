@@ -20,4 +20,4 @@ torchvision
 transformers>=5.0.0
 uharfbuzz>=0.48.0
 ultralytics>=8.3.94
-paddleocr>=2.7.0
+paddleocr>=3.0.0  # >=3.0.0 required for PP-OCRv5 (paddleocr-classic-v5 method); PP-OCRv4 (paddleocr-classic) also works fine on this version
