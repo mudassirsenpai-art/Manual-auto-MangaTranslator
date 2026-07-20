@@ -605,15 +605,14 @@ def main():
             "LLM",
             "manga-ocr",
             "paddleocr-vl-1.6",
-            "surya-ocr",
             "paddleocr-classic",
         ],
         help=(
             "Determines whether to use a vision-capable LLM or a local OCR model for OCR. "
             "Local OCR options enable text-only LLMs for translation "
             "and must be used in 'two-step' translation mode. "
-            "'surya-ocr' and 'paddleocr-classic' (PP-OCRv4, not the VLM) are "
-            "multi-language (Japanese/Korean/Chinese/English) CPU-friendly options."
+            "'paddleocr-classic' (PP-OCRv4, not the VLM) is a "
+            "multi-language (Japanese/Korean/Chinese/English) CPU-friendly option."
         ),
     )
     # Rendering args
