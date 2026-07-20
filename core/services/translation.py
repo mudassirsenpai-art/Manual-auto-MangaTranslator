@@ -217,8 +217,7 @@ def _build_system_prompt_translation(
 - **Text Types:**
   - **Spoken Dialogue/Internal Monologue:** Translate naturally, matching the character's personality.
   - **Narration:** Translate neutrally without special styling.
-  - **Audible SFX:** Translate physical sounds (Giongo) as standard onomatopoeia.
-  - **Mimetic FX:** Translate atmospheric text (Gitaigo) or silent actions as descriptive verbs or adjectives. Do not add a period at the end.
+  - **Audible SFX (Giongo) / Mimetic FX (Gitaigo):** These are hand-drawn sound effects integrated into the art. Output the exact original source text unchanged, character-for-character — do not translate, transliterate, or romanize it.
 {edge_cases}{previous_context_rule}
 """  # noqa
 
@@ -1782,7 +1781,12 @@ def call_translation_api_batch(
     if osb_indices:
         osb_list_str = ", ".join(map(str, osb_indices))
         hints.append(
-            f"Items [{osb_list_str}] contain sound effects, mimetic effects, narration, or internal monologues."
+            f"Items [{osb_list_str}] contain sound effects, mimetic effects, narration, or internal monologues. "
+            "For pure sound effects / onomatopoeia (audible SFX like impact sounds, environmental noise, "
+            "non-verbal exclamations rendered as stylized art text) output the exact original source text "
+            "for that item completely unchanged, character-for-character, instead of translating it — this "
+            "preserves the original hand-drawn art untouched. For narration boxes and internal monologue "
+            "items (actual sentences conveying meaning, not sound effects), translate normally like dialogue."
         )
 
     context_hints = ""
