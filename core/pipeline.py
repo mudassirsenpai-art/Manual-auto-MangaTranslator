@@ -1388,6 +1388,40 @@ def translate_and_render(
 
     if not bubble_data and not outside_text_data:
         log_message("No speech bubbles or outside text detected", always_print=True)
+        if manual_checkpoint_save_path is not None:
+            save_manual_checkpoint(
+                manual_checkpoint_save_path,
+                pil_cleaned_image=final_image_to_save,
+                sorted_bubble_data=[],
+                processed_bubbles_info=[],
+                outside_text_data=[],
+                ocr_texts=[],
+                target_mode=target_mode,
+                image_path=image_path,
+                config=config,
+            )
+            if output_path:
+                final_to_save = final_image_to_save
+                if final_to_save.mode != target_mode:
+                    final_to_save = final_to_save.convert(target_mode)
+                try:
+                    save_image_with_compression(
+                        final_to_save,
+                        output_path,
+                        jpeg_quality=config.output.jpeg_quality,
+                        png_compression=config.output.png_compression,
+                        verbose=verbose,
+                    )
+                except ImageProcessingError as e:
+                    log_message(
+                        f"Failed to save cleaned preview image: {e}",
+                        always_print=True,
+                    )
+            log_message(
+                "Manual mode Pass 1 checkpoint saved (no bubbles or outside text on this page)",
+                always_print=True,
+            )
+            return final_image_to_save
     else:
         if bubble_data:
             log_message(f"Detected {len(bubble_data)} bubbles", verbose=verbose)
