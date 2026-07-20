@@ -1073,3 +1073,90 @@ def extract_text_with_classic_paddleocr(
     except Exception as e:
         log_message(f"Error with PaddleOCR (Classic): {e}", always_print=True)
         return ["[OCR FAILED]"] * len(images)
+
+
+def extract_text_with_classic_paddleocr_v5(
+    images: List[Image.Image],
+    input_language: Optional[str] = None,
+    verbose: bool = False,
+) -> List[str]:
+    """Extract text from images using classic PaddleOCR PP-OCRv5 (mobile),
+    NOT PaddleOCR-VL. This is a fast, non-VLM CPU-friendly OCR engine.
+
+    Unlike extract_text_with_classic_paddleocr() (PP-OCRv4), PP-OCRv5's
+    default recognition model is a single unified weight file covering
+    Simplified Chinese, Traditional Chinese, English, Japanese, and Pinyin
+    all at once - so for manga (JP) and manhua (CN, both scripts), no
+    per-language selection/loop is needed here.
+
+    Korean is NOT included in that unified model (confirmed upstream:
+    PaddlePaddle/PaddleOCR#15373). For Korean input (manhwa), this
+    function instead routes to the separate dedicated
+    `korean_PP-OCRv5_mobile_rec` model via
+    ModelManager.get_paddleocr_classic_v5(korean=True) - still
+    PP-OCRv5-generation accuracy, just a different weight file.
+
+    Args:
+        images: List of PIL Images to process (RGB)
+        input_language: Source language hint (e.g. "Korean", "ko"). Only
+            used to decide unified-model vs. Korean-model; any other
+            value (or unset/"auto") uses the unified CJK+English+Pinyin
+            model, since it covers JP/CN/EN without needing a hint.
+        verbose: Whether to print verbose output
+
+    Returns:
+        List of extracted text strings (one per image). Returns [OCR FAILED] on errors.
+    """
+    if not images:
+        return []
+
+    try:
+        model_manager = get_model_manager()
+        use_korean = _normalize_input_language(input_language) == "korean"
+        ocr_instance = model_manager.get_paddleocr_classic_v5(
+            korean=use_korean, verbose=verbose
+        )
+        engine_label = "PP-OCRv5, Korean" if use_korean else "PP-OCRv5"
+
+        extracted_texts = []
+        for i, img in enumerate(images):
+            try:
+                if img is None:
+                    log_message(
+                        f"Image {i + 1} is None (decode failure), skipping",
+                        always_print=True,
+                    )
+                    extracted_texts.append("[OCR FAILED]")
+                    continue
+
+                log_message(
+                    f"Processing image {i + 1}/{len(images)} with PaddleOCR (Classic, {engine_label})",
+                    verbose=verbose,
+                )
+
+                img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                result = ocr_instance.predict(img_np)
+
+                lines: List[str] = []
+                for res in result or []:
+                    res_dict = res if isinstance(res, dict) else getattr(
+                        res, "json", {}
+                    ).get("res", {})
+                    rec_texts = res_dict.get("rec_texts") or []
+                    lines.extend(t.strip() for t in rec_texts if t and t.strip())
+
+                text = "\n".join(lines)
+                extracted_texts.append(text.strip() if text else "")
+
+            except Exception as e:
+                log_message(
+                    f"PaddleOCR (Classic, {engine_label}) failed for image {i + 1}: {e}",
+                    always_print=True,
+                )
+                extracted_texts.append("[OCR FAILED]")
+
+        return extracted_texts
+
+    except Exception as e:
+        log_message(f"Error with PaddleOCR (Classic, PP-OCRv5): {e}", always_print=True)
+        return ["[OCR FAILED]"] * len(images)
