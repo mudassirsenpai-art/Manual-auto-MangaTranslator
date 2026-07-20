@@ -726,6 +726,7 @@ def create_layout(
                                     "manga-ocr",
                                     "paddleocr-vl-1.6",
                                     "paddleocr-classic",
+                                    "paddleocr-classic-v5",
                                 ],
                                 label="OCR Method",
                                 value=initial_ocr_method,
@@ -734,7 +735,9 @@ def create_layout(
                                     "Local OCR options enable text-only LLMs for translation "
                                     "and must be used in 'two-step' translation mode. "
                                     "'paddleocr-classic' (PP-OCRv4, not the VLM) "
-                                    "supports Japanese/Korean/Chinese/English."
+                                    "supports Japanese/Korean/Chinese/English. "
+                                    "'paddleocr-classic-v5' (PP-OCRv5, mobile) is newer "
+                                    "and more accurate, covering the same languages."
                                 ),
                                 elem_id="ocr_method_radio",
                                 interactive=saved_settings.get(
@@ -1046,7 +1049,7 @@ def create_layout(
                                 info="Allow Gemini 3 Flash to zoom and inspect image details using code execution.",
                                 visible=_initial_enable_code_execution_visible,
                                 interactive=initial_ocr_method
-                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic"),
+                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic", "paddleocr-classic-v5"),
                                 elem_id="enable_code_execution_checkbox",
                             )
 
@@ -1077,7 +1080,7 @@ def create_layout(
                                 info=_initial_image_detail_info,
                                 visible=_initial_image_detail_visible,
                                 interactive=initial_ocr_method
-                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic"),
+                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic", "paddleocr-classic-v5"),
                                 elem_id="image_detail_dropdown",
                             )
 
@@ -1228,7 +1231,7 @@ def create_layout(
                                     "Disable if refusals/using less-capable models or to reduce token usage."
                                 ),
                                 interactive=initial_ocr_method
-                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic"),
+                                not in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic", "paddleocr-classic-v5"),
                             )
                             whiteout_conjoined_bubbles = gr.Checkbox(
                                 value=saved_settings.get(
