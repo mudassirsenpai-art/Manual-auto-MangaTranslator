@@ -2190,7 +2190,7 @@ def handle_translation_mode_change(translation_mode: str, current_ocr_method: st
     import gradio as gr
 
     if translation_mode == "one-step":
-        if current_ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic"):
+        if current_ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic", "paddleocr-classic-v5"):
             return gr.update(value="LLM", interactive=False)
         else:
             return gr.update(interactive=False)
