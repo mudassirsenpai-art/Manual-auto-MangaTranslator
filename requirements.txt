@@ -17,40 +17,7 @@ skia-python>=87.7
 spandrel>=0.3.0
 torch
 torchvision
-# transformers is pinned <5.0.0 (not >=5.0.0) because every pre-"Surya 2"
-# surya-ocr release (0.14.0-0.17.1 - see the surya-ocr comment further down)
-# breaks under transformers>=5.0.0 with:
-#   'SuryaDecoderConfig' object has no attribute 'pad_token_id'
-# This is a confirmed upstream bug (datalab-to/surya#484); the reported fix
-# is to stay on transformers<=4.57.3. diffusers>=0.37.0, manga-ocr, and
-# gradio here don't require transformers>=5.0.0 for anything we use, so
-# pinning down is the lower-risk direction - if a future bump of any of
-# those three starts requiring transformers>=5.0.0, re-check this pin
-# against surya-ocr's status first (upstream may have fixed #484 by then).
-transformers>=4.50.0,<=4.57.3
+transformers>=5.0.0
 uharfbuzz>=0.48.0
 ultralytics>=8.3.94
-# surya-ocr is intentionally NOT listed here. Every 0.14.0-0.17.1 release
-# (the entire pre-"Surya 2" line - 0.18.0/0.19.0 were never published, the
-# next release after 0.17.1 is 0.20.0) pins pillow<11.0.0 / pillow>=10.2.0,
-# which permanently conflicts with this file's pillow>=11.1.0 (needed by
-# gradio and others). 0.20.0+ ("Surya 2") requires a running vllm or
-# llama.cpp inference-server backend, unsuitable for a CPU-only Actions
-# runner, so upgrading past 0.17.1 is not an option either.
-# Fix: install surya-ocr with `pip install --no-deps "surya-ocr>=0.14.0,<0.18.0"`
-# in the CI workflow (see .github/workflows/bot.yml), so pip's resolver never
-# sees the surya-ocr <-> pillow>=11.1.0 clash. Because --no-deps skips ALL of
-# surya-ocr's declared deps, the workflow also runs a verification step
-# (`python -c "import surya..."`) right after install and installs anything
-# it's missing - see the "Clone & Setup MangaTranslator Core" step for the
-# up-to-date, actually-tested list of extra packages surya-ocr needs. Do not
-# hand-copy a dependency list here without cross-checking it against that
-# step; a stale/guessed list will silently break at import time instead of
-# at pip-install time.
-# paddleocr: classic PP-OCRv4 OCR (paddleocr-classic method), NOT the
-# PaddleOCR-VL VLM used by the paddleocr-vl-1.6 method. Also requires the
-# hardware-specific `paddlepaddle` package (CPU/GPU build), which - like
-# torch - is intentionally not listed here and must be installed separately
-# for the target hardware (see the bot repo's CI workflow for the CPU
-# install command).
 paddleocr>=2.7.0
