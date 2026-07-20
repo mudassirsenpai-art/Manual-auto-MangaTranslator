@@ -13,6 +13,7 @@ from core.config import TranslationConfig, calculate_reasoning_budget
 from core.image.image_utils import cv2_to_pil, pil_to_cv2, process_bubble_image_cached
 from core.image.ocr_detection import (
     extract_text_with_classic_paddleocr,
+    extract_text_with_classic_paddleocr_v5,
     extract_text_with_manga_ocr,
     extract_text_with_paddle_ocr_vl,
 )
@@ -78,7 +79,7 @@ TRANSLATION_PATTERN = re.compile(
 # LLM-oriented OCR transcription prompt. Kept as one set so every ocr_method
 # added here only needs updating in one place instead of two duplicated
 # tuples.
-LOCAL_OCR_METHODS = ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic")
+LOCAL_OCR_METHODS = ("manga-ocr", "paddleocr-vl-1.6", "paddleocr-classic", "paddleocr-classic-v5")
 
 
 def _build_system_prompt_ocr(
@@ -1453,6 +1454,93 @@ def _perform_paddleocr_classic(
     return extracted_texts
 
 
+def _perform_paddleocr_classic_v5(
+    images_b64: List[str],
+    bubble_metadata: List[Dict[str, Any]],
+    input_language: Optional[str] = None,
+    debug: bool = False,
+) -> List[str]:
+    """Perform OCR using classic PaddleOCR PP-OCRv5 (mobile), NOT the
+    PaddleOCR-VL VLM.
+
+    Args:
+        images_b64: List of base64-encoded images
+        bubble_metadata: List of metadata dicts for text elements
+        input_language: Source language hint. Only used to route Korean
+            input to the dedicated Korean PP-OCRv5 model (see
+            extract_text_with_classic_paddleocr_v5); any other value
+            (or unset/"auto") uses the unified CJK+English+Pinyin model.
+        debug: Whether to print verbose logging
+
+    Returns:
+        List of extracted text strings, or early return with failure list
+    """
+    total_elements = len(images_b64)
+    log_message("Using PaddleOCR (Classic, PP-OCRv5) for text extraction", verbose=debug)
+
+    cache = get_cache()
+    cache_key = cache.get_manga_ocr_cache_key(
+        images_b64,
+        total_elements,
+        prefix=f"pocrclsv5_{input_language or 'auto'}_",
+    )
+    cached_ocr = cache.get_manga_ocr_result(cache_key)
+    if cached_ocr is not None:
+        if len(cached_ocr) == total_elements:
+            log_message(
+                "Using cached PaddleOCR (Classic, PP-OCRv5) results", verbose=debug
+            )
+            return cached_ocr
+        log_message(
+            "Discarding PaddleOCR (Classic, PP-OCRv5) cache due to length mismatch",
+            verbose=debug,
+        )
+
+    pil_images = _prepare_images_for_ocr(images_b64, verbose=debug)
+    extracted_texts = extract_text_with_classic_paddleocr_v5(
+        pil_images, input_language=input_language, verbose=debug
+    )
+
+    formatted_texts = []
+    for i, text in enumerate(extracted_texts):
+        if text == "[OCR FAILED]" or not text:
+            formatted_texts.append(text if text else "[OCR FAILED]")
+        else:
+            formatted_texts.append(" ".join(text.split()))
+
+    extracted_texts = formatted_texts
+
+    _format_ocr_results(extracted_texts, bubble_metadata)
+
+    if len(extracted_texts) != total_elements:
+        msg = (
+            f"Warning: extracted_texts length ({len(extracted_texts)}) "
+            f"doesn't match total_elements ({total_elements})"
+        )
+        log_message(msg, always_print=True)
+        while len(extracted_texts) < total_elements:
+            extracted_texts.append("[OCR FAILED]")
+        extracted_texts = extracted_texts[:total_elements]
+
+    if not extracted_texts:
+        log_message(
+            "PaddleOCR (Classic, PP-OCRv5) returned empty results", verbose=debug
+        )
+        failure_results = ["[OCR FAILED]"] * total_elements
+        cache.set_manga_ocr_result(cache_key, failure_results, debug)
+        return failure_results
+
+    if _check_ocr_failure(extracted_texts):
+        log_message(
+            "PaddleOCR (Classic, PP-OCRv5) returned only failures", verbose=debug
+        )
+        cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+        return extracted_texts
+
+    cache.set_manga_ocr_result(cache_key, extracted_texts, debug)
+    return extracted_texts
+
+
 def _perform_llm_ocr(
     config: TranslationConfig,
     images_b64: List[str],
@@ -1565,6 +1653,10 @@ def perform_ocr_only_batch(
         extracted_texts = _perform_paddle_ocr_vl(images_b64, bubble_metadata, debug)
     elif config.ocr_method == "paddleocr-classic":
         extracted_texts = _perform_paddleocr_classic(
+            images_b64, bubble_metadata, input_language, debug
+        )
+    elif config.ocr_method == "paddleocr-classic-v5":
+        extracted_texts = _perform_paddleocr_classic_v5(
             images_b64, bubble_metadata, input_language, debug
         )
     else:
@@ -1780,6 +1872,13 @@ Apply your OCR transcription rules to each image provided.{special_instructions_
                 )
             elif config.ocr_method == "paddleocr-classic":
                 extracted_texts = _perform_paddleocr_classic(
+                    images_b64,
+                    bubble_metadata,
+                    input_language,
+                    debug,
+                )
+            elif config.ocr_method == "paddleocr-classic-v5":
+                extracted_texts = _perform_paddleocr_classic_v5(
                     images_b64,
                     bubble_metadata,
                     input_language,
