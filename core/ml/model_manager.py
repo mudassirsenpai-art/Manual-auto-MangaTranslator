@@ -43,6 +43,8 @@ class ModelType(Enum):
     MANGA_OCR = "manga_ocr"
     PADDLE_OCR_VL = "paddle_ocr_vl"
     PADDLEOCR_CLASSIC = "paddleocr_classic"
+    PADDLEOCR_CLASSIC_V5 = "paddleocr_classic_v5"
+    PADDLEOCR_CLASSIC_V5_KOREAN = "paddleocr_classic_v5_korean"
     FLUX_TRANSFORMER = "flux_transformer"
     FLUX_TEXT_ENCODER = "flux_text_encoder"
     FLUX_PIPELINE = "flux_pipeline"
@@ -1025,6 +1027,84 @@ class ModelManager:
             )
             return ocr_instance
 
+    def get_paddleocr_classic_v5(self, korean: bool = False, verbose: bool = False):
+        """Get a PP-OCRv5 (mobile) PaddleOCR instance, loading it if
+        necessary.
+
+        Unlike get_paddleocr_classic() (PP-OCRv4), PP-OCRv5's default
+        recognition model is a single unified weight file that covers
+        Simplified Chinese, Traditional Chinese, English, Japanese, and
+        Pinyin all at once - so for that case, no per-language instance/
+        cache or `lang` selection is needed (see
+        extract_text_with_classic_paddleocr_v5 in ocr_detection.py).
+        `ocr_version="PP-OCRv5"` with no explicit lang defaults PaddleOCR
+        to its multilingual mobile det/rec models, which on CPU benchmark
+        at roughly the same latency as PP-OCRv4_mobile while scoring far
+        higher on accuracy (PaddleOCR's internal benchmark: 53.0% weighted
+        average for v4 vs 80.1% for v5, with the largest gains on
+        handwriting/artistic-font/multilingual text - relevant for manga/
+        manhwa/manhua speech bubbles). The `server` variant is deliberately
+        NOT used here: it benchmarks around 40x slower than `mobile` on
+        CPU, unsuitable for a CPU-only Actions runner.
+
+        Korean is NOT included in that unified model (confirmed upstream:
+        PaddlePaddle/PaddleOCR#15373). PaddleOCR later shipped a separate
+        dedicated `korean_PP-OCRv5_mobile_rec` recognition model instead,
+        selected explicitly via `text_recognition_model_name` - so Korean
+        (manhwa) still gets PP-OCRv5-generation accuracy, just via a
+        different weight file than the CJK+EN+Pinyin one, cached
+        separately since only one recognition model is active at a time.
+
+        Args:
+            korean: If True, load the dedicated Korean PP-OCRv5 recognition
+                model instead of the unified CJK+English+Pinyin one.
+            verbose: Whether to print verbose logging
+
+        Returns:
+            A PaddleOCR instance configured for PP-OCRv5 (mobile).
+        """
+        model_type = (
+            ModelType.PADDLEOCR_CLASSIC_V5_KOREAN
+            if korean
+            else ModelType.PADDLEOCR_CLASSIC_V5
+        )
+        with self._lock:
+            if self.is_loaded(model_type):
+                return self.models[model_type]
+
+            label = "Korean" if korean else "multilingual (CJK+EN+Pinyin)"
+            log_message(
+                f"Initializing PaddleOCR (Classic, PP-OCRv5, mobile, {label})...",
+                verbose=verbose,
+            )
+
+            from paddleocr import PaddleOCR
+
+            if korean:
+                ocr_instance = PaddleOCR(
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
+            else:
+                ocr_instance = PaddleOCR(
+                    ocr_version="PP-OCRv5",
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name="PP-OCRv5_mobile_rec",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
+
+            self.models[model_type] = ocr_instance
+            log_message(
+                f"PaddleOCR (Classic, PP-OCRv5, mobile, {label}) initialized.",
+                verbose=verbose,
+            )
+            return ocr_instance
+
     def load_sam2(self, verbose: bool = False):
         """Load SAM 2.1 model and processor.
 
@@ -1463,6 +1543,10 @@ class ModelManager:
             models_unloaded.append("paddle_ocr_vl")
         if self.is_loaded(ModelType.PADDLEOCR_CLASSIC):
             models_unloaded.append("paddleocr_classic")
+        if self.is_loaded(ModelType.PADDLEOCR_CLASSIC_V5):
+            models_unloaded.append("paddleocr_classic_v5")
+        if self.is_loaded(ModelType.PADDLEOCR_CLASSIC_V5_KOREAN):
+            models_unloaded.append("paddleocr_classic_v5_korean")
 
         self.unload_model(ModelType.YOLO_SPEECH_BUBBLE, force_gc=False, verbose=verbose)
         self.unload_model(
@@ -1481,6 +1565,12 @@ class ModelManager:
         # single model object, but unload_model()'s is_loaded()/del handling
         # works unchanged since it only checks the slot is non-None.
         self.unload_model(ModelType.PADDLEOCR_CLASSIC, force_gc=True, verbose=verbose)
+        self.unload_model(
+            ModelType.PADDLEOCR_CLASSIC_V5, force_gc=True, verbose=verbose
+        )
+        self.unload_model(
+            ModelType.PADDLEOCR_CLASSIC_V5_KOREAN, force_gc=True, verbose=verbose
+        )
 
         if models_unloaded:
             log_message("OCR models unloaded.", verbose=verbose)
